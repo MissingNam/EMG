@@ -59,7 +59,7 @@
 <div class="opts">
   <label><input type="checkbox" id="optDc" checked> Quitar DC</label>
   <label><input type="checkbox" id="optNotch"> Notch 60 Hz</label>
-  <label>Ganancia total <input type="number" id="optGain" value="160" min="1" step="1"></label>
+  <label>Ganancia total <input type="number" id="optGain" value="10" min="1" step="1"></label>
   <label>Umbral (x reposo) <input type="number" id="optThr" value="3" min="1" step="0.5"></label>
 </div>
 
@@ -67,11 +67,11 @@
 'use strict';
 const SERVICE_UUID = 'a1e60001-7c3d-4b6a-9d2e-3f5b8c1d0001';
 const CHAR_UUID    = 'a1e60002-7c3d-4b6a-9d2e-3f5b8c1d0001';
-const FS = 1000;                 // Hz, debe coincidir con el firmware
+const FS = 860;                  // Hz, ADS1115 a 860 SPS (el real varia hasta ~10 %)
 const WINDOW_S = 4;              // segundos visibles
 const BUF_N = FS * WINDOW_S;
 const DC_ALPHA = 0.002;          // seguidor de DC (corte ~0.3 Hz)
-const ADC_MAX = 4095, ADC_VREF = 3.3;
+const ADC_MAX = 32768, ADC_VREF = 0.256;   // ADS1115 int16, PGA +-0.256 V
 
 const $ = id => document.getElementById(id);
 
@@ -88,9 +88,9 @@ let ymin = -50, ymax = 50;
 
 // Registro crudo (Uint16 por bloques)
 const CHUNK = 65536;
-let logChunks = [new Uint16Array(CHUNK)], logPos = 0, logTotal = 0;
+let logChunks = [new Int16Array(CHUNK)], logPos = 0, logTotal = 0;
 function logSample(v) {
-  if (logPos === CHUNK) { logChunks.push(new Uint16Array(CHUNK)); logPos = 0; }
+  if (logPos === CHUNK) { logChunks.push(new Int16Array(CHUNK)); logPos = 0; }
   logChunks[logChunks.length - 1][logPos++] = v;
   logTotal++;
 }
@@ -137,7 +137,7 @@ function onData(ev) {
   lastSeq = seq;
   pktCount++;
   const n = (len - 2) >> 1;
-  for (let i = 0; i < n; i++) pushSample(dv.getUint16(2 + 2 * i, true));
+  for (let i = 0; i < n; i++) pushSample(dv.getInt16(2 + 2 * i, true));
 }
 
 // ---------- BLE ----------
@@ -212,7 +212,7 @@ function saveCsv() {
 
 function clearAll() {
   ring.fill(0); head = 0; filled = 0;
-  logChunks = [new Uint16Array(CHUNK)]; logPos = 0; logTotal = 0;
+  logChunks = [new Int16Array(CHUNK)]; logPos = 0; logTotal = 0;
   pktCount = 0; lostCount = 0; lastSeq = null; dc = null;
   baseline = null; ymin = -50; ymax = 50;
 }
