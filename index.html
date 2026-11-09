@@ -68,7 +68,7 @@
 const SERVICE_UUID = 'a1e60001-7c3d-4b6a-9d2e-3f5b8c1d0001';
 const CHAR_UUID    = 'a1e60002-7c3d-4b6a-9d2e-3f5b8c1d0001';
 const FS = 860;                  // Hz, ADS1115 a 860 SPS (el real varia hasta ~10 %)
-const WINDOW_S = 4;              // segundos visibles
+const WINDOW_S = 0.5;              // segundos visibles
 const BUF_N = FS * WINDOW_S;
 const DC_ALPHA = 0.002;          // seguidor de DC (corte ~0.3 Hz)
 const ADC_MAX = 32768, ADC_VREF = 0.256;   // ADS1115 int16, PGA +-0.256 V
