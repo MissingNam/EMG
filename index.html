@@ -26,6 +26,8 @@
   .opts label { display:flex; gap:6px; align-items:center; color:var(--mut); }
   .opts input[type=number] { width:70px; background:var(--bg); color:var(--fg); border:1px solid #2c3746; border-radius:6px; padding:6px; font-size:15px; }
   .opts input[type=checkbox] { width:18px; height:18px; }
+  .opts select { background:var(--bg); color:var(--fg); border:1px solid #2c3746; border-radius:6px; padding:6px; font-size:15px; }
+  .opts input[type=range] { flex:1; min-width:120px; }
   #warn { color:var(--bad); }
 </style>
 </head>
@@ -44,6 +46,19 @@
 </div>
 
 <div id="plotwrap"><canvas id="plot"></canvas></div>
+
+<div class="opts" style="margin-bottom:10px">
+  <label style="flex:1 1 100%">Ventana: <b id="winTxt" style="color:var(--fg); min-width:64px">300 ms</b>
+    <input type="range" id="optWin" min="0" max="100" step="1" value="25"></label>
+  <label>Trazo
+    <select id="optStyle">
+      <option value="line">Lineas</option>
+      <option value="both">Lineas + puntos</option>
+      <option value="points">Puntos</option>
+    </select></label>
+  <label title="Pasa-bajas solo para la pantalla; 0 = sin suavizado">Suavizado (Hz) <input type="number" id="optLp" value="0" min="0" step="10"></label>
+  <label>Escala Y &plusmn;cuentas <input type="number" id="optY" value="0" min="0" step="50"></label>
+</div>
 
 <div class="grid">
   <div class="m"><b>RMS (200 ms), cuentas</b><span id="vRms">-</span></div>
@@ -68,8 +83,8 @@
 const SERVICE_UUID = 'a1e60001-7c3d-4b6a-9d2e-3f5b8c1d0001';
 const CHAR_UUID    = 'a1e60002-7c3d-4b6a-9d2e-3f5b8c1d0001';
 const FS = 860;                  // Hz, ADS1115 a 860 SPS (el real varia hasta ~10 %)
-const WINDOW_S = 0.5;              // segundos visibles
-const BUF_N = FS * WINDOW_S;
+const WIN_MIN_S = 0.1, WIN_MAX_S = 8;   // ventana visible ajustable: 100 ms a 8 s
+const BUF_N = Math.round(FS * 10);      // el buffer guarda 10 s
 const DC_ALPHA = 0.002;          // seguidor de DC (corte ~0.3 Hz)
 const ADC_MAX = 32768, ADC_VREF = 0.256;   // ADS1115 int16, PGA +-0.256 V
 
@@ -80,6 +95,9 @@ let device = null, server = null, charac = null, wakeLock = null;
 const ring = new Float32Array(BUF_N);
 let head = 0, filled = 0;
 let frozen = false;
+let snap = null, snapHead = 0, snapFilled = 0;   // copia del buffer al congelar
+let sm = null, lastN = 9, yc = 0, lastDraw = 0;
+const disp = new Float32Array(BUF_N);   // ventana visible (con suavizado opcional)
 let lastSeq = null, pktCount = 0, lostCount = 0, rateCount = 0, rateT0 = performance.now(), rate = 0;
 let dc = null;
 let baseline = null, calibrating = false, calEnd = 0, calVals = [];
@@ -125,6 +143,12 @@ function pushSample(raw) {
   if (filled < BUF_N) filled++;
 }
 
+function fillGap(k) {   // paquetes perdidos: mantiene el eje de tiempo repitiendo el ultimo valor
+  if (filled === 0) return;
+  const v = ring[(head - 1 + BUF_N) % BUF_N];
+  for (let i = 0; i < k; i++) { ring[head] = v; head = (head + 1) % BUF_N; if (filled < BUF_N) filled++; }
+}
+
 function onData(ev) {
   const dv = ev.target.value;
   const len = dv.byteLength;
@@ -132,12 +156,13 @@ function onData(ev) {
   const seq = dv.getUint16(0, true);
   if (lastSeq !== null) {
     const exp = (lastSeq + 1) & 0xFFFF;
-    if (seq !== exp) lostCount += (seq - exp) & 0xFFFF;
+    if (seq !== exp) { const lost = (seq - exp) & 0xFFFF; lostCount += lost; fillGap(Math.min(lost * lastN, BUF_N)); }
   }
   lastSeq = seq;
   pktCount++;
   const n = (len - 2) >> 1;
   for (let i = 0; i < n; i++) pushSample(dv.getInt16(2 + 2 * i, true));
+  lastN = n;
 }
 
 // ---------- BLE ----------
@@ -160,7 +185,7 @@ async function connect() {
     charac = await svc.getCharacteristic(CHAR_UUID);
     charac.addEventListener('characteristicvaluechanged', onData);
     await charac.startNotifications();
-    lastSeq = null; dc = null;
+    lastSeq = null; dc = null; sm = null;
     $('btnConnect').disabled = true;
     $('btnDisc').disabled = false;
     $('btnCal').disabled = false;
@@ -213,7 +238,8 @@ function saveCsv() {
 function clearAll() {
   ring.fill(0); head = 0; filled = 0;
   logChunks = [new Int16Array(CHUNK)]; logPos = 0; logTotal = 0;
-  pktCount = 0; lostCount = 0; lastSeq = null; dc = null;
+  pktCount = 0; lostCount = 0; lastSeq = null; dc = null; sm = null;
+  snapFilled = 0;
   baseline = null; ymin = -50; ymax = 50;
 }
 
@@ -228,59 +254,130 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
+function winSeconds() {                  // el deslizador (0..100) recorre 0.1 s a 8 s en escala logaritmica
+  const v = (+$('optWin').value || 0) / 100;
+  return WIN_MIN_S * Math.pow(WIN_MAX_S / WIN_MIN_S, v);
+}
+function fmtT(t) { return t < 1 ? Math.round(t * 1000) + ' ms' : (+t.toFixed(2)) + ' s'; }
+const STEPS = [0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2];
+
 function draw() {
   requestAnimationFrame(draw);
-  if (frozen) return;
+  const t = performance.now();
+  if (t - lastDraw < 28) return;           // ~35 cuadros/s bastan y ahorran bateria
+  lastDraw = t;
+
+  const winS = winSeconds();
+  $('winTxt').textContent = fmtT(winS);
+  const src = frozen ? snap : ring;
+  const hd = frozen ? snapHead : head;
+  const fl = frozen ? snapFilled : filled;
   const W = cv.width, H = cv.height, dpr = window.devicePixelRatio || 1;
   ctx.fillStyle = '#1a212b';
   ctx.fillRect(0, 0, W, H);
-  if (filled < 2) return;
 
-  const n = filled, start = (head - n + BUF_N) % BUF_N;
-  const mins = new Float32Array(W).fill(Infinity);
-  const maxs = new Float32Array(W).fill(-Infinity);
-  let gmin = Infinity, gmax = -Infinity;
+  const N = Math.max(2, Math.round(winS * FS));      // muestras que caben en pantalla
+  const n = Math.min(fl, N);
+  if (n < 2 || !src) return;
+  const start = (hd - n + BUF_N) % BUF_N;
+  const px = W / (N - 1);                            // pixeles por muestra
+  const x0 = W - (n - 1) * px;                       // la muestra mas nueva queda a la derecha
+  const style = $('optStyle').value;
+
+  for (let j = 0; j < n; j++) disp[j] = src[(start + j) % BUF_N];
+  const fcs = parseFloat($('optLp').value) || 0;     // suavizado solo para la pantalla (no toca CSV ni RMS)
+  if (fcs > 0) {
+    const a = 1 - Math.exp(-2 * Math.PI * fcs / FS);
+    let y = disp[0];
+    for (let j = 0; j < n; j++) { y += a * (disp[j] - y); disp[j] = y; }
+    for (let j = n - 1; j >= 0; j--) { y += a * (disp[j] - y); disp[j] = y; }   // pasada inversa: sin desfase
+  }
+
+  let gmin = Infinity, gmax = -Infinity, sum = 0;
   for (let j = 0; j < n; j++) {
-    const v = ring[(start + j) % BUF_N];
-    const col = Math.min(W - 1, Math.floor((BUF_N - n + j) * W / BUF_N));
-    if (v < mins[col]) mins[col] = v;
-    if (v > maxs[col]) maxs[col] = v;
+    const v = disp[j];
     if (v < gmin) gmin = v;
     if (v > gmax) gmax = v;
+    sum += v;
   }
   // escala automatica: crece de inmediato, se contrae despacio
   ymin = gmin < ymin ? gmin : ymin + (gmin - ymin) * 0.03;
   ymax = gmax > ymax ? gmax : ymax + (gmax - ymax) * 0.03;
-  let lo = ymin, hi = ymax;
-  if (hi - lo < 20) { const m = (hi + lo) / 2; lo = m - 10; hi = m + 10; }
-  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  let lo, hi;
+  const ys = parseFloat($('optY').value) || 0;
+  if (ys > 0) {                                      // escala manual
+    if ($('optDc').checked) yc = 0; else yc += (sum / n - yc) * 0.1;
+    lo = yc - ys; hi = yc + ys;
+  } else {
+    lo = ymin; hi = ymax;
+    if (hi - lo < 20) { const m = (hi + lo) / 2; lo = m - 10; hi = m + 10; }
+    const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  }
   const Y = v => H - (v - lo) / (hi - lo) * H;
 
-  // rejilla
+  // rejilla de tiempo (fija respecto a "ahora") y linea de cero
+  const dt = winS / 5;
+  let step = STEPS[STEPS.length - 1];
+  for (const s of STEPS) { if (s >= dt) { step = s; break; } }
+  const pxPerSec = px * FS;
   ctx.strokeStyle = '#2c3746'; ctx.lineWidth = 1;
   ctx.beginPath();
-  for (let s = 1; s < WINDOW_S; s++) { const x = Math.round(s * W / WINDOW_S) + 0.5; ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let k = step; k < winS; k += step) { const x = Math.round(W - k * pxPerSec) + 0.5; ctx.moveTo(x, 0); ctx.lineTo(x, H); }
   if (lo < 0 && hi > 0) { const y = Math.round(Y(0)) + 0.5; ctx.moveTo(0, y); ctx.lineTo(W, y); }
   ctx.stroke();
 
-  // senal (envolvente min-max por columna)
-  ctx.strokeStyle = '#3fb6ff'; ctx.lineWidth = Math.max(1, dpr);
-  ctx.beginPath();
-  for (let c = 0; c < W; c++) {
-    if (mins[c] === Infinity) continue;
-    const x = c + 0.5;
-    let y1 = Y(maxs[c]), y2 = Y(mins[c]);
-    if (y2 - y1 < 1) { y1 -= 0.5; y2 += 0.5; }
-    ctx.moveTo(x, y1); ctx.lineTo(x, y2);
+  // senal
+  const dense = px < 0.7;                            // mas de ~1.4 muestras por pixel
+  ctx.strokeStyle = '#3fb6ff'; ctx.fillStyle = '#3fb6ff';
+  ctx.lineWidth = Math.max(1.5, 1.5 * dpr); ctx.lineJoin = 'round';
+  if (style !== 'points') {
+    ctx.beginPath();
+    if (!dense) {
+      for (let j = 0; j < n; j++) {
+        const x = x0 + j * px, y = Y(disp[j]);
+        if (j) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+    } else {
+      // muchas muestras por pixel: en cada columna se une primero, extremos y ultimo; la linea queda continua
+      let col = -1, first = 0, last = 0, mn = 0, mx = 0, imn = 0, imx = 0, started = false;
+      const flush = () => {
+        if (col < 0) return;
+        const x = col + 0.5;
+        const pts = imn < imx ? [first, mn, mx, last] : [first, mx, mn, last];
+        for (const v of pts) {
+          const y = Y(v);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+      };
+      for (let j = 0; j < n; j++) {
+        const v = disp[j];
+        const c = Math.min(W - 1, Math.floor(x0 + j * px));
+        if (c !== col) { flush(); col = c; first = last = mn = mx = v; imn = imx = j; }
+        else { last = v; if (v < mn) { mn = v; imn = j; } if (v > mx) { mx = v; imx = j; } }
+      }
+      flush();
+    }
+    ctx.stroke();
   }
-  ctx.stroke();
+  if (style !== 'line') {
+    const r = dense ? 0.75 * dpr : Math.max(1.5, 2 * dpr);
+    for (let j = 0; j < n; j++) {
+      const x = x0 + j * px, y = Y(disp[j]);
+      ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+    }
+  }
 
   // etiquetas
+  const gain = Math.max(1, parseFloat($('optGain').value) || 1);
+  const halfUv = (hi - lo) / 2 * ADC_VREF / ADC_MAX / gain * 1e6;
   ctx.fillStyle = '#8b98a8';
   ctx.font = (11 * dpr) + 'px system-ui, sans-serif';
   ctx.fillText(hi.toFixed(0), 4 * dpr, 12 * dpr);
   ctx.fillText(lo.toFixed(0), 4 * dpr, H - 4 * dpr);
-  ctx.fillText(WINDOW_S + ' s', W - 30 * dpr, H - 4 * dpr);
+  ctx.textAlign = 'right';
+  ctx.fillText('±' + (halfUv >= 1000 ? (halfUv / 1000).toFixed(2) + ' mV' : halfUv.toFixed(0) + ' µV') + ' en la entrada', W - 6 * dpr, 12 * dpr);
+  ctx.fillText(fmtT(winS) + '  (' + fmtT(step) + '/div)', W - 6 * dpr, H - 4 * dpr);
+  ctx.textAlign = 'left';
 }
 requestAnimationFrame(draw);
 
@@ -335,6 +432,7 @@ $('btnConnect').addEventListener('click', connect);
 $('btnDisc').addEventListener('click', disconnect);
 $('btnFreeze').addEventListener('click', () => {
   frozen = !frozen;
+  if (frozen) { snap = ring.slice(); snapHead = head; snapFilled = filled; }
   $('btnFreeze').textContent = frozen ? 'Reanudar' : 'Congelar';
 });
 $('btnCal').addEventListener('click', () => {
